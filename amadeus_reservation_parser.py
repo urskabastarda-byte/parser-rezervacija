@@ -944,15 +944,16 @@ if result:
     st.markdown("#### Prepoznani podatki")
 
     # Kompakten prikaz podatkov za agenta: brez ponavljanja imen, PNR-ja in letov.
-    st.markdown('<div class="section-card"><div class="section-title">Oddana prtljaga – prebrano iz TST-ja</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-card"><div class="section-title">Prtljaga</div><div style="font-size:13px;font-weight:400;color:#555;margin:2px 0 8px;">Oddana prtljaga – prebrano iz TST-ja</div>', unsafe_allow_html=True)
     st.write(baggage_text)
     st.markdown("</div>", unsafe_allow_html=True)
     cabin_baggage = st.checkbox("Ročna prtljaga vključena", value=True, key="cabin_baggage")
 
-    st.markdown('<div class="section-card"><div class="section-title">Cena, prebrana iz TST-ja</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-card"><div class="section-title">Cena</div>', unsafe_allow_html=True)
     if price:
-        st.markdown(f"<div style='font-size:17px;font-weight:700;color:#004899'>{html.escape(price['display'])}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:17px;font-weight:700;color:#004899'>{html.escape(price['display'])}</div><div style='font-size:12px;font-weight:400;color:#666;margin-top:1px;'>(prebrano iz TST-ja)</div>", unsafe_allow_html=True)
     else:
+        st.markdown("<div style='font-size:12px;font-weight:400;color:#666;'>(prebrano iz TST-ja)</div>", unsafe_allow_html=True)
         st.write("Cena ni bila prepoznana. Preveri vrstice TOTAL / GRAND TOTAL.")
     st.markdown("</div>", unsafe_allow_html=True)
     final_price = st.text_input("Cena za stranko", placeholder="Agent vnese končno ceno", key="final_price")
