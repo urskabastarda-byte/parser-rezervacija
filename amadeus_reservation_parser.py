@@ -460,6 +460,9 @@ def parse_segments(raw):
             "flight": (
                 f"{item['airline_name']} {item['airline']}{item['flight_number']}"
             ),
+            # Keep the raw airline code and flight number for matching TST baggage.
+            "airline": item["airline"],
+            "flight_number": item["flight_number"],
             "origin": origin,
             "destination": destination,
             "origin_city": origin_city,
