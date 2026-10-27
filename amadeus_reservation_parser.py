@@ -1,0 +1,976 @@
+
+import re
+import csv
+import io
+import html
+import json
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+from urllib.request import urlopen
+
+import streamlit as st
+import airportsdata
+import streamlit.components.v1 as components
+
+
+st.set_page_config(
+    page_title="Amadeus – Reservation Parser",
+    page_icon="✈️",
+    layout="wide",
+)
+
+
+# ---------------------------------------------------------
+# LETALIŠČA
+# Ključ: IATA koda; vrednost: slovensko ime mesta in časovni pas
+# ---------------------------------------------------------
+
+AIRPORTS = {
+    "LJU": ("Ljubljana", "Europe/Ljubljana"),
+    "ZAG": ("Zagreb", "Europe/Zagreb"),
+    "VIE": ("Dunaj", "Europe/Vienna"),
+    "TRS": ("Trst", "Europe/Rome"),
+    "VCE": ("Benetke", "Europe/Rome"),
+    "MXP": ("Milano Malpensa", "Europe/Rome"),
+    "LIN": ("Milano Linate", "Europe/Rome"),
+    "FCO": ("Rim Fiumicino", "Europe/Rome"),
+    "CIA": ("Rim Ciampino", "Europe/Rome"),
+    "NAP": ("Neapelj", "Europe/Rome"),
+    "BLQ": ("Bologna", "Europe/Rome"),
+    "CDG": ("Pariz Charles de Gaulle", "Europe/Paris"),
+    "ORY": ("Pariz Orly", "Europe/Paris"),
+    "AMS": ("Amsterdam", "Europe/Amsterdam"),
+    "FRA": ("Frankfurt", "Europe/Berlin"),
+    "MUC": ("München", "Europe/Berlin"),
+    "ZRH": ("Zürich", "Europe/Zurich"),
+    "BRU": ("Bruselj", "Europe/Brussels"),
+    "LHR": ("London Heathrow", "Europe/London"),
+    "LGW": ("London Gatwick", "Europe/London"),
+    "IST": ("Istanbul", "Europe/Istanbul"),
+    "SAW": ("Istanbul Sabiha Gökçen", "Europe/Istanbul"),
+    "ATH": ("Atene", "Europe/Athens"),
+    "MAD": ("Madrid", "Europe/Madrid"),
+    "BCN": ("Barcelona", "Europe/Madrid"),
+    "LIS": ("Lizbona", "Europe/Lisbon"),
+    "JFK": ("New York JFK", "America/New_York"),
+    "EWR": ("Newark", "America/New_York"),
+    "ORD": ("Chicago", "America/Chicago"),
+    "LAX": ("Los Angeles", "America/Los_Angeles"),
+    "DXB": ("Dubaj", "Asia/Dubai"),
+    "DOH": ("Doha", "Asia/Qatar"),
+    "AUH": ("Abu Dabi", "Asia/Dubai"),
+    "SIN": ("Singapur", "Asia/Singapore"),
+    "HKG": ("Hongkong", "Asia/Hong_Kong"),
+    "HND": ("Tokio Haneda", "Asia/Tokyo"),
+    "NRT": ("Tokio Narita", "Asia/Tokyo"),
+    "PEK": ("Peking", "Asia/Shanghai"),
+    "PVG": ("Šanghaj Pudong", "Asia/Shanghai"),
+    "BKK": ("Bangkok", "Asia/Bangkok"),
+    "DEL": ("Delhi", "Asia/Kolkata"),
+    "BOM": ("Mumbai", "Asia/Kolkata"),
+    "SYD": ("Sydney", "Australia/Sydney"),
+    "MEL": ("Melbourne", "Australia/Melbourne"),
+    "YYZ": ("Toronto", "America/Toronto"),
+    "YUL": ("Montreal", "America/Toronto"),
+    "GRU": ("São Paulo", "America/Sao_Paulo"),
+    "CPT": ("Cape Town", "Africa/Johannesburg"),
+    "JNB": ("Johannesburg", "Africa/Johannesburg"),
+    "MEX": ("Mexico City", "America/Mexico City"),
+    "GDL": ("Guadalajara", "America/Guadalajara"),
+    "ATL": ("Atlanta", "America/Atlanta"),
+    "BSL": ("Basel Mulhouse", "Europe/Zurich"),
+    "GGZ": ("Železniška postaja Gradec", "Europe/Graz"),
+    "ZWS": ("Zürich železniška postaja", "Europe/Zurich"),
+}
+
+
+# ---------------------------------------------------------
+# POMOŽNE FUNKCIJE
+# ---------------------------------------------------------
+
+# Naložimo celotno bazo IATA kod iz knjižnice airportsdata.
+# Ključi slovarja so trimestne IATA kode.
+try:
+    AIRPORT_DATABASE = airportsdata.load("IATA")
+except Exception:
+    # Če se knjižnica ali njeni podatki iz kakršnegakoli razloga ne naložijo,
+    # aplikacija še vedno lahko uporabi spodnji lasten slovar.
+    AIRPORT_DATABASE = {}
+
+
+def airport_info(code):
+    code = (code or "").strip().upper()
+
+    # Najprej poiščemo podatke v obsežni bazi.
+    airport = AIRPORT_DATABASE.get(code, {})
+
+    # Nato ohranimo naša ročno določena imena, ki imajo prednost
+    # pred privzetimi angleškimi imeni iz baze.
+    local_name, fallback_timezone = AIRPORTS.get(code, ("", "UTC"))
+
+    city = (
+        local_name
+        or airport.get("city")
+        or airport.get("name")
+        or code
+    )
+
+    timezone_name = airport.get("tz") or fallback_timezone or "UTC"
+
+    # Preverimo, ali je časovni pas veljaven. Napačen ali manjkajoč podatek
+    # ne sme povzročiti sesutja aplikacije.
+    try:
+        ZoneInfo(timezone_name)
+    except Exception:
+        timezone_name = "UTC"
+
+    return city, timezone_name
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_airline_database():
+    """
+    Naloži javni seznam letalskih družb z OpenFlights.
+    Če internetni vir ni dosegljiv, aplikacija še vedno deluje z našim seznamom.
+    """
+    url = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat"
+
+    try:
+        with urlopen(url, timeout=5) as response:
+            content = response.read().decode("utf-8", errors="replace")
+
+        airlines = {}
+        reader = csv.reader(io.StringIO(content))
+        for row in reader:
+            # OpenFlights format: ID, Name, Alias, IATA, ICAO, Callsign, Country, Active
+            if len(row) < 8:
+                continue
+
+            code = row[3].strip().upper()
+            name = row[1].strip()
+
+            if code and code != r"\\N" and name and name != r"\\N":
+                # Prva najdena veljavna vrednost za kodo ostane v slovarju.
+                airlines.setdefault(code, name)
+
+        return airlines
+    except Exception:
+        return {}
+
+
+# Naša imena imajo vedno prednost pred imeni iz spletne baze.
+# Seznam lahko kadarkoli razširimo z dodatnimi kodami.
+AIRLINE_NAMES = {
+    "KL": "KLM",
+    "AF": "Air France",
+    "LH": "Lufthansa",
+    "AZ": "ITA Airways",
+    "BA": "British Airways",
+    "IB": "Iberia",
+    "LX": "SWISS",
+    "OS": "Austrian Airlines",
+    "SN": "Brussels Airlines",
+    "TK": "Turkish Airlines",
+    "QR": "Qatar Airways",
+    "EK": "Emirates",
+    "EY": "Etihad Airways",
+    "LO": "LOT Polish Airlines",
+    "SK": "SAS",
+    "AY": "Finnair",
+    "TP": "TAP Air Portugal",
+    "UA": "United Airlines",
+    "AA": "American Airlines",
+    "DL": "Delta Air Lines",
+    "AC": "Air Canada",
+    "QF": "Qantas",
+    "SQ": "Singapore Airlines",
+    "CX": "Cathay Pacific",
+    "NH": "ANA",
+    "JL": "Japan Airlines",
+    "CA": "Air China",
+    "MU": "China Eastern Airlines",
+    "CZ": "China Southern Airlines",
+    "TG": "Thai Airways",
+    "AI": "Air India",
+    "ET": "Ethiopian Airlines",
+    "MS": "Egyptair",
+    "AT": "Royal Air Maroc",
+    "RJ": "Royal Jordanian",
+    "JU": "Air Serbia",
+    "OU": "Croatia Airlines",
+    "JP": "Adria Airways",
+    "W6": "Wizz Air",
+    "FR": "Ryanair",
+    "U2": "easyJet",
+    "VY": "Vueling",
+    "PC": "Pegasus Airlines",
+    "A3": "Aegean Airlines",
+    "FZ": "flydubai",
+    "WY": "Oman Air",
+    "GF": "Gulf Air",
+    "ME": "Middle East Airlines",
+}
+
+
+AIRLINE_DATABASE = load_airline_database()
+
+
+def airline_name(code):
+    """Naše ime → ime iz spletne baze → sama koda kot varnostna rezerva."""
+    code = (code or "").strip().upper()
+    if code in AIRLINE_NAMES:
+        return AIRLINE_NAMES[code]
+    return AIRLINE_DATABASE.get(code) or code
+
+
+def parse_date(token, year):
+    """Prebere datum v obliki 24SEP, 7OCT itd."""
+    token = token.upper().strip()
+    match = re.fullmatch(r"(\d{1,2})([A-Z]{3})", token)
+
+    if not match:
+        return None
+
+    day = int(match.group(1))
+    month_text = match.group(2)
+
+    months = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
+        "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
+        "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+    }
+
+    month = months.get(month_text)
+
+    if not month:
+        return None
+
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def format_duration(minutes):
+    if minutes is None or minutes < 0:
+        return "—"
+
+    hours, mins = divmod(minutes, 60)
+
+    if hours and mins:
+        return f"{hours} h {mins} min"
+    if hours:
+        return f"{hours} h"
+
+    return f"{mins} min"
+
+
+def time_difference_minutes(
+    start_date,
+    start_time,
+    start_tz,
+    end_date,
+    end_time,
+    end_tz,
+):
+    """Izračuna trajanje med lokalnima časoma ob upoštevanju časovnih pasov."""
+    try:
+        start_dt = datetime.strptime(
+            f"{start_date.isoformat()} {start_time}",
+            "%Y-%m-%d %H%M",
+        ).replace(tzinfo=ZoneInfo(start_tz))
+
+        end_dt = datetime.strptime(
+            f"{end_date.isoformat()} {end_time}",
+            "%Y-%m-%d %H%M",
+        ).replace(tzinfo=ZoneInfo(end_tz))
+
+        return int((end_dt - start_dt).total_seconds() // 60)
+
+    except (ValueError, KeyError, Exception):
+        return None
+
+
+# ---------------------------------------------------------
+# PARSANJE AMADEUS SEGMENTOV
+# ---------------------------------------------------------
+
+def parse_segments(raw):
+    """Prepozna standardne in razširjene Amadeus vrstice segmentov."""
+    raw_lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    parsed = []
+
+    # Segmentna glava: številka segmenta je lahko prisotna ali odsotna;
+    # številka leta je lahko zapisana kot AZ1358 ali AZ  60.
+    header_pattern = re.compile(
+        r"^\s*(?:\d+\s+)?\*?\s*"
+        r"(?P<airline>[A-Z0-9]{2})\s*"
+        r"(?P<flight>\d{1,4})\s+"
+        r"(?P<class>[A-Z])\s+"
+        r"(?P<date>\d{1,2}[A-Z]{3})\s+"
+        r"(?:(?P<dow>\d)\s+)?"
+        r"(?P<route_rest>.*)$",
+        re.IGNORECASE,
+    )
+
+    # Letališči sta lahko zapisani skupaj (LJUAMS) ali ločeno (FCO MAD),
+    # za njima pa se lahko pojavijo številke terminalov (npr. FCO 1 MAD 2).
+    spaced_route_pattern = re.compile(
+        r"^\s*(?P<origin>[A-Z]{3})\s+(?:\d+\s+)?"
+        r"(?P<destination>[A-Z]{3})(?:\s+\d+)?\s+(?P<rest>.*)$",
+        re.IGNORECASE,
+    )
+    compact_route_pattern = re.compile(
+        r"^\s*(?P<route>[A-Z]{6})(?P<rest>.*)$",
+        re.IGNORECASE,
+    )
+
+    matched_lines = []
+    for line in raw_lines:
+        header = header_pattern.match(line)
+        if not header:
+            continue
+
+        route_rest = header.group("route_rest")
+        route_match = spaced_route_pattern.match(route_rest)
+        if route_match:
+            origin = route_match.group("origin").upper()
+            destination = route_match.group("destination").upper()
+            rest = route_match.group("rest")
+        else:
+            route_match = compact_route_pattern.match(route_rest)
+            if route_match:
+                route = route_match.group("route").upper()
+                origin, destination = route[:3], route[3:]
+                rest = route_match.group("rest")
+                # Kompaktna relacija lahko vsebuje terminal za ciljnim letališčem.
+                rest = re.sub(r"^\s+\d+\b", "", rest, count=1)
+            else:
+                # V nekaterih kopiranih prikazih je zadnji cilj izpuščen.
+                # Cilj dopolnimo samo, če gre očitno za povratni let:
+                # trenutni odhod = prejšnji cilj, cilj = prvi odhod.
+                one_airport = re.match(
+                    r"^\s*(?P<origin>[A-Z]{3})\s+(?P<rest>.*)$",
+                    route_rest,
+                    re.IGNORECASE,
+                )
+                if not one_airport or not matched_lines:
+                    continue
+                origin = one_airport.group("origin").upper()
+                rest = one_airport.group("rest")
+                first_origin = matched_lines[0]["origin"]
+                previous_destination = matched_lines[-1]["destination"]
+                if origin != previous_destination or origin == first_origin:
+                    continue
+                destination = first_origin
+
+        # Status (npr. HK1) ni obvezen v vseh Amadeus prikazih.
+        # Vzamemo prva dva časovna zapisa, ki se pojavita za relacijo.
+        times = re.findall(r"(?<!\d)(\d{4})(?!\d)", rest)
+        if len(times) < 2:
+            continue
+
+        matched_lines.append({
+            "airline": header.group("airline").upper(),
+            "airline_name": airline_name(header.group("airline")),
+            "flight_number": header.group("flight").upper(),
+            "date_token": header.group("date").upper(),
+            "origin": origin,
+            "destination": destination,
+            "departure_time": times[0],
+            "arrival_time": times[1],
+        })
+
+    if not matched_lines:
+        return []
+
+    # Samodejna ocena leta:
+    # če je prvi datum že mimo, predpostavimo naslednje leto.
+    today = date.today()
+    current_year = today.year
+
+    first_date = parse_date(
+        matched_lines[0]["date_token"],
+        current_year,
+    )
+
+    if first_date and first_date < today:
+        base_year = current_year + 1
+    else:
+        base_year = current_year
+
+    previous_date = None
+
+    for item in matched_lines:
+        flight_date = parse_date(item["date_token"], base_year)
+
+        if not flight_date:
+            continue
+
+        # Če se datum v zaporedju premakne nazaj, gre praviloma
+        # za prehod v naslednje koledarsko leto.
+        if previous_date and flight_date < previous_date:
+            base_year += 1
+            flight_date = parse_date(item["date_token"], base_year)
+
+        if not flight_date:
+            continue
+
+        previous_date = flight_date
+
+        origin = item["origin"]
+        destination = item["destination"]
+
+        origin_city, origin_tz = airport_info(origin)
+        destination_city, destination_tz = airport_info(destination)
+
+        departure_time = item["departure_time"]
+        arrival_time = item["arrival_time"]
+
+        arrival_date = flight_date
+
+        duration = time_difference_minutes(
+            flight_date,
+            departure_time,
+            origin_tz,
+            arrival_date,
+            arrival_time,
+            destination_tz,
+        )
+
+        # Če je trajanje negativno, preverimo prihod naslednji dan.
+        if duration is not None and duration < 0:
+            next_day = flight_date + timedelta(days=1)
+
+            next_day_duration = time_difference_minutes(
+                flight_date,
+                departure_time,
+                origin_tz,
+                next_day,
+                arrival_time,
+                destination_tz,
+            )
+
+            if next_day_duration is not None and next_day_duration >= 0:
+                arrival_date = next_day
+                duration = next_day_duration
+
+        parsed.append({
+            "date": flight_date,
+            "flight": (
+                f"{item['airline_name']} {item['airline']}{item['flight_number']}"
+            ),
+            "origin": origin,
+            "destination": destination,
+            "origin_city": origin_city,
+            "destination_city": destination_city,
+            "departure": (
+                departure_time[:2] + ":" + departure_time[2:]
+            ),
+            "arrival": (
+                arrival_time[:2] + ":" + arrival_time[2:]
+            ),
+            "duration_minutes": duration,
+            "arrival_date": arrival_date,
+        })
+
+    # Izračun prestopov med zaporednimi segmenti.
+    for i, segment in enumerate(parsed):
+        segment["layover_minutes"] = None
+
+        if i >= len(parsed) - 1:
+            continue
+
+        next_segment = parsed[i + 1]
+
+        # Prestop izračunamo le, kadar naslednji let odleti
+        # z letališča, na katerem se prejšnji konča.
+        if segment["destination"] != next_segment["origin"]:
+            continue
+
+        _, timezone_name = airport_info(segment["destination"])
+
+        try:
+            arrival_dt = datetime.strptime(
+                f"{segment['arrival_date'].isoformat()} "
+                f"{segment['arrival']}",
+                "%Y-%m-%d %H:%M",
+            ).replace(tzinfo=ZoneInfo(timezone_name))
+
+            next_departure_dt = datetime.strptime(
+                f"{next_segment['date'].isoformat()} "
+                f"{next_segment['departure']}",
+                "%Y-%m-%d %H:%M",
+            ).replace(tzinfo=ZoneInfo(timezone_name))
+
+            layover_minutes = int(
+                (next_departure_dt - arrival_dt).total_seconds() // 60
+            )
+
+            if 0 <= layover_minutes <= 18 * 60:
+                segment["layover_minutes"] = layover_minutes
+
+        except Exception:
+            segment["layover_minutes"] = None
+
+    return parsed
+
+
+
+
+# ---------------------------------------------------------
+# RESERVATION PARSER – PODATKI IZ PNR + TST
+# ---------------------------------------------------------
+
+MONTHS_SL = {
+    1: "januar", 2: "februar", 3: "marec", 4: "april",
+    5: "maj", 6: "junij", 7: "julij", 8: "avgust",
+    9: "september", 10: "oktober", 11: "november", 12: "december",
+}
+
+NAME_TITLES = {
+    "MR", "MRS", "MS", "MISS", "MSTR", "DR", "PROF",
+    "M", "F", "CHD", "INF",
+}
+
+def nice_name(raw_name):
+    """BASTARDA/ANDREJ MR -> Andrej Bastarda."""
+    raw_name = raw_name.strip().upper()
+    if "/" not in raw_name:
+        return raw_name.title()
+    surname, given = raw_name.split("/", 1)
+    given_parts = [p for p in re.split(r"[\s-]+", given.strip()) if p]
+    given_parts = [p for p in given_parts if p not in NAME_TITLES]
+    surname_parts = [p for p in re.split(r"[\s-]+", surname.strip()) if p]
+    return " ".join(given_parts + surname_parts).title()
+
+
+def parse_passengers(raw):
+    """Poišče potniška imena v PNR/TST vrsticah, pri čemer odstrani podvojitve."""
+    found = []
+    patterns = [
+        re.compile(r"(?<![A-Z0-9])\d+\.\s*([A-Z][A-Z' -]+/[A-Z][A-Z' -]+?)(?=\s{2,}\d+\.|\s*$)", re.I),
+        re.compile(r"(?<![A-Z0-9])\d+\.\s*([A-Z][A-Z' -]+/[A-Z][A-Z' -]+)", re.I),
+    ]
+    for line in raw.splitlines():
+        if not re.search(r"\d+\.", line):
+            continue
+        for pattern in patterns:
+            for match in pattern.finditer(line):
+                value = re.sub(r"\s+", " ", match.group(1)).strip()
+                # Avoid matching unrelated numbered fields.
+                if "/" in value and len(value) < 70 and re.search(r"[A-Z]", value):
+                    formatted = nice_name(value)
+                    if formatted and formatted not in found:
+                        found.append(formatted)
+            if found:
+                break
+    return found
+
+
+def parse_record_locator(raw):
+    """Najprej išče 6-mestno oznako na RP-vrstici, nato varnostno po celotnem PNR."""
+    for line in raw.splitlines():
+        if line.strip().upper().startswith("RP/"):
+            tokens = re.findall(r"\b[A-Z0-9]{6}\b", line.upper())
+            if tokens:
+                return tokens[-1]
+    # Fallback: običajno je locator v glavi PNR, za datumom/časom.
+    for line in raw.splitlines()[:8]:
+        if "RP/" in line.upper():
+            match = re.search(r"\b([A-Z0-9]{6})\s*$", line.strip().upper())
+            if match:
+                return match.group(1)
+    return ""
+
+
+def parse_tst_price(raw):
+    """Vrne ceno iz GRAND TOTAL, sicer TOTAL; nikoli ne ugiba."""
+    patterns = [
+        r"GRAND\s+TOTAL\s+([A-Z]{3})\s+([\d,]+(?:\.\d{2})?)",
+        r"(?m)^\s*TOTAL\s+([A-Z]{3})\s+([\d,]+(?:\.\d{2})?)\s*$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, re.I | re.M)
+        if match:
+            currency = match.group(1).upper()
+            amount_text = match.group(2).replace(",", "")
+            try:
+                amount = float(amount_text)
+                return {"currency": currency, "amount": amount, "display": f"{amount:,.2f} {currency}".replace(",", "X").replace(".", ",").replace("X", ".")}
+            except ValueError:
+                pass
+    return None
+
+
+def parse_tst_baggage(raw):
+    """Prebere dovoljene kose/težo iz TST vrstic po posameznem letu."""
+    baggage_by_flight = {}
+    row_pattern = re.compile(
+        r"^\s*\d+\s+[A-Z]{3}\s+([A-Z0-9]{2})\s*(\d{1,4})\b",
+        re.I,
+    )
+    baggage_pattern = re.compile(r"\b(\d{1,2}\s*PC|\d{1,3}\s*KG)\b", re.I)
+
+    for line in raw.splitlines():
+        match = row_pattern.match(line)
+        if not match:
+            continue
+        flight_key = (match.group(1).upper(), match.group(2))
+        baggage_match = baggage_pattern.search(line)
+        if baggage_match:
+            value = re.sub(r"\s+", "", baggage_match.group(1).upper())
+            baggage_by_flight[flight_key] = value
+
+    return baggage_by_flight
+
+
+def baggage_summary(segments, baggage_by_flight):
+    if not segments:
+        return "Oddana prtljaga ni potrjena."
+    values = []
+    for segment in segments:
+        key = (segment["airline"], segment["flight_number"])
+        value = baggage_by_flight.get(key)
+        if value:
+            values.append(value)
+        else:
+            values.append(None)
+
+    if not any(values):
+        return "Oddana prtljaga ni potrjena iz predloženega TST-ja."
+
+    if all(v == values[0] for v in values) and values[0]:
+        value = values[0]
+        if value.endswith("PC"):
+            count = int(value[:-2])
+            unit = "kos" if count == 1 else "kosa" if count == 2 else "kosov"
+            return f"{count} {unit} oddane prtljage na vsakem letu."
+        if value.endswith("KG"):
+            return f"Oddana prtljaga: {value[:-2]} kg na vsakem letu."
+
+    parts = []
+    for segment, value in zip(segments, values):
+        label = f"{segment['airline']}{segment['flight_number']}"
+        if value and value.endswith("PC"):
+            count = int(value[:-2])
+            unit = "kos" if count == 1 else "kosa" if count == 2 else "kosov"
+            parts.append(f"{label}: {count} {unit}")
+        elif value and value.endswith("KG"):
+            parts.append(f"{label}: {value[:-2]} kg")
+        else:
+            parts.append(f"{label}: ni potrjeno")
+    return "Oddana prtljaga – " + "; ".join(parts) + "."
+
+
+def parse_reservation(raw):
+    segments = parse_segments(raw)
+    passengers = parse_passengers(raw)
+    locator = parse_record_locator(raw)
+    price = parse_tst_price(raw)
+    baggage = parse_tst_baggage(raw)
+    return {
+        "segments": segments,
+        "passengers": passengers,
+        "locator": locator,
+        "price": price,
+        "baggage_by_flight": baggage,
+    }
+
+
+def format_money_input(value):
+    """Dovoljuje vnos z decimalno vejico ali piko; vrača uporabniku prijazen zapis."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    return value
+
+
+def build_summary_text(passengers, locator, segments, baggage_text, cabin_baggage,
+                       final_price, currency, change_fee, cancellation_fee):
+    lines = ["POVZETEK LETALSKE REZERVACIJE", ""]
+    lines.append("Potnik(i): " + (", ".join(passengers) if passengers else "Ni prepoznano"))
+    lines.append("Številka rezervacije: " + (locator or "Ni prepoznana"))
+    lines.append("")
+    lines.append("REZERVIRANI LETI")
+    if not segments:
+        lines.append("Leti niso bili prepoznani iz prilepljenih podatkov.")
+    for segment in segments:
+        date_text = segment["date"].strftime("%d.%m.%Y")
+        route = (
+            f"{segment['origin_city']} ({segment['origin']}) – "
+            f"{segment['destination_city']} ({segment['destination']})"
+        )
+        arrival_suffix = " (+1 dan)" if segment["arrival_date"] > segment["date"] else ""
+        lines.append(
+            f"{date_text} | {segment['flight']} | {route} | "
+            f"{segment['departure']}–{segment['arrival']}{arrival_suffix}"
+        )
+    lines.append("")
+    lines.append("PRTLJAGA")
+    lines.append("Ročna prtljaga: vključena." if cabin_baggage else "Ročna prtljaga: ni vključena.")
+    lines.append(baggage_text)
+    lines.append("")
+    lines.append("KONČNA CENA")
+    if final_price.strip():
+        lines.append(f"{final_price.strip()} {currency}")
+    else:
+        lines.append("Ni vnesena.")
+    lines.append("")
+    lines.append("POGOJI VOZOVNICE")
+    lines.append("Strošek spremembe: " + (change_fee.strip() or "Ni vnesen"))
+    lines.append("Strošek odpovedi: " + (cancellation_fee.strip() or "Ni vnesen"))
+    return "\n".join(lines)
+
+
+def render_copy_all_button(summary_text, summary_html):
+    safe_text = json.dumps(summary_text, ensure_ascii=False)
+    safe_html = json.dumps(summary_html, ensure_ascii=False)
+    components.html(
+        f"""
+        <div style="font-family:Roboto,Arial,sans-serif;">
+          <button id="copyAll"
+            style="background:#004899;color:#fff;border:0;border-bottom:4px solid #FBB900;
+                   border-radius:7px;padding:11px 18px;font-family:Roboto,Arial,sans-serif;
+                   font-size:14px;font-weight:700;cursor:pointer;">
+            📋 Kopiraj celoten povzetek
+          </button>
+          <span id="copyStatus" style="font-size:12px;color:#004899;margin-left:10px;"></span>
+        </div>
+        <script>
+          const htmlSummary = {safe_html};
+          const plainText = {safe_text};
+          document.getElementById("copyAll").addEventListener("click", async () => {{
+            const status = document.getElementById("copyStatus");
+            try {{
+              if (navigator.clipboard && window.ClipboardItem) {{
+                const item = new ClipboardItem({{
+                  "text/html": new Blob([htmlSummary], {{type:"text/html"}}),
+                  "text/plain": new Blob([plainText], {{type:"text/plain"}})
+                }});
+                await navigator.clipboard.write([item]);
+                status.textContent = "Celoten povzetek je kopiran.";
+              }} else if (navigator.clipboard && navigator.clipboard.writeText) {{
+                await navigator.clipboard.writeText(plainText);
+                status.textContent = "Povzetek je kopiran kot besedilo.";
+              }} else {{
+                status.textContent = "Kopiranje ni podprto v tem brskalniku.";
+              }}
+            }} catch (err) {{
+              status.textContent = "Kopiranje ni uspelo. Poskusi znova.";
+            }}
+          }});
+        </script>
+        """,
+        height=62,
+    )
+
+
+# ---------------------------------------------------------
+# VIZUALNI SLOG
+# ---------------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
+    html, body, [class*="css"], [data-testid="stAppViewContainer"] {
+        font-family: 'Roboto', Arial, sans-serif !important;
+    }
+    .stApp { background: #F7F9FC; }
+    [data-testid="stHeader"] { background: rgba(247,249,252,0.95); }
+    h1, h2, h3 { color: #004899 !important; font-family: 'Roboto', Arial, sans-serif !important; }
+    .hero {
+        background: #004899; color: white; border-radius: 14px; padding: 22px 26px;
+        border-bottom: 6px solid #FBB900; margin-bottom: 16px;
+    }
+    .hero h1 { color: white !important; margin: 0; font-size: 30px; }
+    .hero p { color: #EAF1FA; margin: 7px 0 0 0; }
+    .section-card {
+        background: white; border: 1px solid #E2E8F0; border-radius: 12px;
+        padding: 16px 18px; margin: 8px 0 14px 0;
+    }
+    .section-title {
+        color: #004899; font-weight: 700; font-size: 18px;
+        border-bottom: 3px solid #FBB900; padding-bottom: 7px; margin-bottom: 10px;
+    }
+    .pill {
+        display:inline-block; background:#FFF4CC; color:#004899; border-radius:20px;
+        padding:4px 10px; font-size:12px; font-weight:700; margin:2px 4px 2px 0;
+    }
+    div.stButton > button[kind="primary"] {
+        background: #004899; color: white; border: 0; border-bottom: 4px solid #FBB900;
+        border-radius: 7px; font-family: 'Roboto', Arial, sans-serif; font-weight: 700;
+    }
+    div.stButton > button[kind="primary"]:hover { background: #003875; color: white; }
+    [data-testid="stTextArea"] textarea, [data-testid="stTextInput"] input {
+        font-family: 'Roboto', Arial, sans-serif !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="hero">
+      <h1>✈️ Amadeus Reservation Parser</h1>
+      <p>Iz PNR-ja in TST-ja do preglednega povzetka rezervacije za stranko.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown("### 1. Vnos podatkov")
+st.caption("Prilepi celoten PNR in TST skupaj v eno polje. Parser bo sam poiskal podatke, ki jih zna prepoznati.")
+
+raw_input = st.text_area(
+    "PNR + TST",
+    height=300,
+    placeholder=(
+        "Prilepi sem celoten zapis iz Amadeusa, vključno s PNR-jem in TST-jem.\n\n"
+        "Primer: RP/LJUS... ZQAXGZ\n"
+        "1.BASTARDA/ANDREJ MR\n"
+        "3 CA 974 T 07MAR 7 VCEPEK HK2 2115 1415+1 *1A/E*\n"
+        "...\n"
+        "GRAND TOTAL EUR 875.20"
+    ),
+    key="reservation_raw",
+)
+
+if st.button("Analiziraj rezervacijo", type="primary", use_container_width=False):
+    result = parse_reservation(raw_input)
+    st.session_state["reservation_result"] = result
+    st.session_state["reservation_raw_saved"] = raw_input
+
+result = st.session_state.get("reservation_result")
+
+if result:
+    segments = result["segments"]
+    passengers = result["passengers"]
+    locator = result["locator"]
+    price = result["price"]
+    baggage_text = baggage_summary(segments, result["baggage_by_flight"])
+
+    st.markdown("### 2. Pregled prepoznanih podatkov")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<div class="section-card"><div class="section-title">Potnik(i)</div>', unsafe_allow_html=True)
+        st.write(", ".join(passengers) if passengers else "Imen potnikov nisem prepoznala.")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with col2:
+        st.markdown('<div class="section-card"><div class="section-title">Številka rezervacije</div>', unsafe_allow_html=True)
+        st.write(locator or "Številke rezervacije nisem prepoznala.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section-card"><div class="section-title">Rezervirani leti</div>', unsafe_allow_html=True)
+    if segments:
+        rows = []
+        for segment in segments:
+            rows.append({
+                "Datum": segment["date"].strftime("%d.%m.%Y"),
+                "Let": segment["flight"],
+                "Relacija": f"{segment['origin_city']} ({segment['origin']}) – {segment['destination_city']} ({segment['destination']})",
+                "Odhod": segment["departure"],
+                "Prihod": segment["arrival"] + (" (+1 dan)" if segment["arrival_date"] > segment["date"] else ""),
+                "Trajanje leta": format_duration(segment["duration_minutes"]),
+                "Čas prestopa": format_duration(segment["layover_minutes"]),
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.warning("Letov nisem prepoznala. Preveri, ali so v vnosu vrstice segmentov iz PNR-ja.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("### 3. Prtljaga")
+    luggage_col1, luggage_col2 = st.columns(2)
+    with luggage_col1:
+        cabin_baggage = st.checkbox("Ročna prtljaga vključena", value=True, key="cabin_baggage")
+    with luggage_col2:
+        st.markdown('<div class="section-card"><div class="section-title">Oddana prtljaga (iz TST-ja)</div>', unsafe_allow_html=True)
+        st.write(baggage_text)
+        st.caption("Oddana prtljaga je prebrana iz TST-ja in je v tem orodju ni mogoče ročno spreminjati.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("### 4. Cena in pogoji vozovnice")
+    price_col, reference_col = st.columns([1.2, 1])
+    with price_col:
+        final_price = st.text_input("Končna cena za stranko", placeholder="Agent vnese končno ceno", key="final_price")
+        currency = st.selectbox("Valuta", ["EUR", "USD", "GBP", "CHF", "Other"], index=0, key="final_currency")
+    with reference_col:
+        if price:
+            st.markdown('<div class="section-card"><div class="section-title">Cena, prebrana iz TST-ja</div>', unsafe_allow_html=True)
+            st.markdown(f"<h3 style='margin:0;color:#004899'>{html.escape(price['display'])}</h3>", unsafe_allow_html=True)
+            st.caption("Referenčni podatek za kontrolo; ne nadomesti agentove končne cene.")
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.info("Cena iz TST-ja ni bila prepoznana. Preveri vrstice TOTAL / GRAND TOTAL.")
+    fee_col1, fee_col2 = st.columns(2)
+    with fee_col1:
+        change_fee = st.text_input("Strošek spremembe", placeholder="Npr. 150 EUR ali brezplačno", key="change_fee")
+    with fee_col2:
+        cancellation_fee = st.text_input("Strošek odpovedi", placeholder="Npr. 250 EUR ali nevračljiva vozovnica", key="cancellation_fee")
+
+    st.markdown("### 5. Končni povzetek")
+    summary_text = build_summary_text(
+        passengers, locator, segments, baggage_text, cabin_baggage,
+        final_price, currency, change_fee, cancellation_fee,
+    )
+
+    # HTML različica za kopiranje v e-pošto/Word; plain text je varnostna alternativa.
+    summary_html_lines = [
+        '<div style="font-family:Roboto,Arial,sans-serif;color:#243247;">',
+        '<h2 style="color:#004899;border-bottom:4px solid #FBB900;padding-bottom:8px;">POVZETEK LETALSKE REZERVACIJE</h2>',
+        f"<p><b>Potnik(i):</b> {html.escape(', '.join(passengers) if passengers else 'Ni prepoznano')}<br>",
+        f"<b>Številka rezervacije:</b> {html.escape(locator or 'Ni prepoznana')}</p>",
+        '<h3 style="color:#004899;">Rezervirani leti</h3>',
+        '<table style="border-collapse:collapse;font-family:Roboto,Arial,sans-serif;font-size:13px;width:100%;">',
+        '<tr style="background:#004899;color:white;">'
+    ]
+    for header in ["Datum", "Let", "Relacija", "Odhod", "Prihod"]:
+        summary_html_lines.append(f'<th style="padding:8px;text-align:left;border-bottom:4px solid #FBB900;">{header}</th>')
+    summary_html_lines.append("</tr>")
+    for idx, segment in enumerate(segments):
+        bg = "#FFF9E9" if idx % 2 else "#FFFFFF"
+        date_text = segment["date"].strftime("%d.%m.%Y")
+        flight = segment["flight"]
+        route = f"{segment['origin_city']} ({segment['origin']}) – {segment['destination_city']} ({segment['destination']})"
+        arrival = segment["arrival"] + (" (+1 dan)" if segment["arrival_date"] > segment["date"] else "")
+        values = [date_text, flight, route, segment["departure"], arrival]
+        summary_html_lines.append(f'<tr style="background:{bg};">')
+        for value in values:
+            summary_html_lines.append(f'<td style="padding:8px;border-bottom:1px solid #E2E8F0;">{html.escape(value)}</td>')
+        summary_html_lines.append("</tr>")
+    summary_html_lines.extend([
+        "</table>",
+        '<h3 style="color:#004899;">Prtljaga</h3>',
+        f"<p>{html.escape('Ročna prtljaga vključena.' if cabin_baggage else 'Ročna prtljaga ni vključena.')}<br>{html.escape(baggage_text)}</p>",
+        '<h3 style="color:#004899;">Cena in pogoji vozovnice</h3>',
+        f"<p><b>Končna cena:</b> {html.escape((final_price.strip() + ' ' + currency).strip() if final_price.strip() else 'Ni vnesena.')}<br>",
+        f"<b>Strošek spremembe:</b> {html.escape(change_fee.strip() or 'Ni vnesen')}<br>",
+        f"<b>Strošek odpovedi:</b> {html.escape(cancellation_fee.strip() or 'Ni vnesen')}</p>",
+        "</div>",
+    ])
+    summary_html = "".join(summary_html_lines)
+
+    st.markdown(
+        f'<div class="section-card" style="white-space:pre-wrap;">{html.escape(summary_text)}</div>',
+        unsafe_allow_html=True,
+    )
+    render_copy_all_button(summary_text, summary_html)
+
+    st.download_button(
+        "⬇️ Prenesi povzetek (.txt)",
+        data=summary_text,
+        file_name=f"rezervacija_{locator or 'povzetek'}.txt",
+        mime="text/plain",
+    )
+
+    with st.expander("Tehnični pregled – kaj je parser prepoznal"):
+        st.write(f"Prepoznani leti: {len(segments)}")
+        st.write(f"Prepoznani potniki: {len(passengers)}")
+        st.write(f"Številka rezervacije: {locator or 'ni prepoznana'}")
+        st.write(f"Cena iz TST-ja: {price['display'] if price else 'ni prepoznana'}")
+        if not segments:
+            st.code(st.session_state.get("reservation_raw_saved", ""), language=None)
+else:
+    st.info("Prilepi PNR in TST skupaj, nato klikni »Analiziraj rezervacijo«.")
