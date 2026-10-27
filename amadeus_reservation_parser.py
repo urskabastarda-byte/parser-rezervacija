@@ -609,8 +609,11 @@ def parse_tst_price(raw):
 def parse_tst_baggage(raw):
     """Prebere dovoljene kose/težo iz TST vrstic po posameznem letu."""
     baggage_by_flight = {}
+    # TST segment lines can appear as either "1   VCE CA  974 ..." or
+    # "2 X PEK CA  783 ..." / "4 O MEL CA  166 ...". The optional
+    # one-letter indicator (X/O, etc.) must not prevent baggage detection.
     row_pattern = re.compile(
-        r"^\s*\d+\s+[A-Z]{3}\s+([A-Z0-9]{2})\s*(\d{1,4})\b",
+        r"^\s*\d+\s+(?:[A-Z]\s+)?[A-Z]{3}\s+([A-Z0-9]{2})\s+(\d{1,4})\b",
         re.I,
     )
     baggage_pattern = re.compile(r"\b(\d{1,2}\s*PC|\d{1,3}\s*KG)\b", re.I)
@@ -829,7 +832,7 @@ st.caption("Prilepi celoten PNR in TST skupaj v eno polje. Parser bo sam poiskal
 
 raw_input = st.text_area(
     "PNR + TST",
-    height=300,
+    height=190,
     placeholder=(
         "Prilepi sem celoten zapis iz Amadeusa, vključno s PNR-jem in TST-jem.\n\n"
         "Primer: RP/LJUS... ZQAXGZ\n"
@@ -919,21 +922,35 @@ if result:
         final_price, currency, change_fee, cancellation_fee,
     )
 
-    # HTML različica za kopiranje v e-pošto/Word; plain text je varnostna alternativa.
+    # Lep HTML predložek za prikaz in kopiranje v e-pošto/Word.
+    # Plain-text različica ostane alternativa za odložišče, ki ne podpira HTML-ja.
+    passenger_text = ", ".join(passengers) if passengers else "Ni prepoznano"
+    locator_text = locator or "Ni prepoznana"
+    final_price_text = ((final_price.strip() + " " + currency).strip()
+                        if final_price.strip() else "Ni vnesena")
+    cabin_text = "Vključena" if cabin_baggage else "Ni vključena"
+
     summary_html_lines = [
-        '<div style="font-family:Roboto,Arial,sans-serif;color:#243247;">',
-        '<h2 style="color:#004899;border-bottom:4px solid #FBB900;padding-bottom:8px;">POVZETEK LETALSKE REZERVACIJE</h2>',
-        f"<p><b>Potnik(i):</b> {html.escape(', '.join(passengers) if passengers else 'Ni prepoznano')}<br>",
-        f"<b>Številka rezervacije:</b> {html.escape(locator or 'Ni prepoznana')}</p>",
-        '<h3 style="color:#004899;">Rezervirani leti</h3>',
-        '<table style="border-collapse:collapse;font-family:Roboto,Arial,sans-serif;font-size:13px;width:100%;">',
-        '<tr style="background:#004899;color:white;">'
+        '<div style="font-family:Roboto,Arial,sans-serif;color:#233044;max-width:100%;line-height:1.45;">',
+        '<div style="padding:20px 22px 16px;background:#004899;border-radius:10px 10px 0 0;color:#ffffff;">',
+        '<div style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:#FBB900;font-weight:700;">POTOVALNI DOKUMENT</div>',
+        '<div style="font-size:24px;font-weight:700;margin-top:4px;">Povzetek letalske rezervacije</div>',
+        '</div>',
+        '<div style="border:1px solid #DCE3EC;border-top:0;padding:14px 18px 16px;border-radius:0 0 10px 10px;">',
+        '<table style="border-collapse:collapse;width:100%;font-size:13px;margin-bottom:18px;">',
+        '<tr>',
+        f'<td style="width:68%;vertical-align:top;padding:8px 12px 8px 0;border-bottom:2px solid #FBB900;"><div style="font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:.7px;">Potnik(i)</div><div style="font-size:14px;font-weight:700;color:#004899;">{html.escape(passenger_text)}</div></td>',
+        f'<td style="width:32%;vertical-align:top;padding:8px 0 8px 12px;border-bottom:2px solid #FBB900;"><div style="font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:.7px;">Številka rezervacije</div><div style="font-size:14px;font-weight:700;color:#004899;">{html.escape(locator_text)}</div></td>',
+        '</tr></table>',
+        '<div style="font-size:16px;font-weight:700;color:#004899;margin:0 0 8px;">Rezervirani leti</div>',
+        '<table style="border-collapse:collapse;font-family:Roboto,Arial,sans-serif;font-size:12px;width:100%;margin-bottom:18px;">',
+        '<tr style="background:#004899;color:#ffffff;">'
     ]
     for header in ["Datum", "Let", "Relacija", "Odhod", "Prihod"]:
-        summary_html_lines.append(f'<th style="padding:8px;text-align:left;border-bottom:4px solid #FBB900;">{header}</th>')
+        summary_html_lines.append(f'<th style="padding:9px 7px;text-align:left;border-bottom:3px solid #FBB900;white-space:nowrap;">{header}</th>')
     summary_html_lines.append("</tr>")
     for idx, segment in enumerate(segments):
-        bg = "#FFF9E9" if idx % 2 else "#FFFFFF"
+        bg = "#F5F8FC" if idx % 2 else "#FFFFFF"
         date_text = segment["date"].strftime("%d.%m.%Y")
         flight = segment["flight"]
         route = f"{segment['origin_city']} ({segment['origin']}) – {segment['destination_city']} ({segment['destination']})"
@@ -941,24 +958,27 @@ if result:
         values = [date_text, flight, route, segment["departure"], arrival]
         summary_html_lines.append(f'<tr style="background:{bg};">')
         for value in values:
-            summary_html_lines.append(f'<td style="padding:8px;border-bottom:1px solid #E2E8F0;">{html.escape(value)}</td>')
+            summary_html_lines.append(f'<td style="padding:9px 7px;border-bottom:1px solid #E2E8F0;vertical-align:top;">{html.escape(value)}</td>')
         summary_html_lines.append("</tr>")
     summary_html_lines.extend([
         "</table>",
-        '<h3 style="color:#004899;">Prtljaga</h3>',
-        f"<p>{html.escape('Ročna prtljaga vključena.' if cabin_baggage else 'Ročna prtljaga ni vključena.')}<br>{html.escape(baggage_text)}</p>",
-        '<h3 style="color:#004899;">Cena in pogoji vozovnice</h3>',
-        f"<p><b>Končna cena:</b> {html.escape((final_price.strip() + ' ' + currency).strip() if final_price.strip() else 'Ni vnesena.')}<br>",
-        f"<b>Strošek spremembe:</b> {html.escape(change_fee.strip() or 'Ni vnesen')}<br>",
-        f"<b>Strošek odpovedi:</b> {html.escape(cancellation_fee.strip() or 'Ni vnesen')}</p>",
-        "</div>",
+        '<div style="font-size:16px;font-weight:700;color:#004899;margin:0 0 8px;">Prtljaga</div>',
+        '<table style="border-collapse:collapse;width:100%;font-size:13px;margin-bottom:18px;">',
+        f'<tr><td style="padding:8px 10px;background:#F5F8FC;border-bottom:1px solid #E2E8F0;width:38%;font-weight:700;">Ročna prtljaga</td><td style="padding:8px 10px;border-bottom:1px solid #E2E8F0;">{html.escape(cabin_text)}</td></tr>',
+        f'<tr><td style="padding:8px 10px;background:#F5F8FC;font-weight:700;">Oddana prtljaga</td><td style="padding:8px 10px;">{html.escape(baggage_text.removesuffix("."))}</td></tr>',
+        '</table>',
+        '<div style="font-size:16px;font-weight:700;color:#004899;margin:0 0 8px;">Cena in pogoji vozovnice</div>',
+        '<table style="border-collapse:collapse;width:100%;font-size:13px;">',
+        f'<tr><td style="padding:9px 10px;background:#FFF7DF;border-left:4px solid #FBB900;font-weight:700;width:38%;">Končna cena</td><td style="padding:9px 10px;background:#FFF7DF;color:#004899;font-size:17px;font-weight:700;">{html.escape(final_price_text)}</td></tr>',
+        f'<tr><td style="padding:8px 10px;background:#F5F8FC;border-bottom:1px solid #E2E8F0;font-weight:700;">Strošek spremembe</td><td style="padding:8px 10px;border-bottom:1px solid #E2E8F0;">{html.escape(change_fee.strip() or "Ni vnesen")}</td></tr>',
+        f'<tr><td style="padding:8px 10px;background:#F5F8FC;font-weight:700;">Strošek odpovedi</td><td style="padding:8px 10px;">{html.escape(cancellation_fee.strip() or "Ni vnesen")}</td></tr>',
+        '</table>',
+        '<div style="margin-top:16px;padding-top:10px;border-top:1px solid #DCE3EC;color:#64748B;font-size:10px;">Povzetek rezervacije · Preverite podatke in pogoje vozovnice pred pošiljanjem stranki.</div>',
+        '</div></div>',
     ])
     summary_html = "".join(summary_html_lines)
 
-    st.markdown(
-        f'<div class="section-card" style="white-space:pre-wrap;">{html.escape(summary_text)}</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(summary_html, unsafe_allow_html=True)
     render_copy_all_button(summary_text, summary_html)
 
     st.download_button(
