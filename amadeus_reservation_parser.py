@@ -918,8 +918,8 @@ raw_input = st.text_area(
     height=115,
     placeholder=(
         "Prilepi sem celoten zapis iz Amadeusa, vključno s PNR-jem in TST-jem.\n\n"
-        "Primer: RP/LJUS... ZQAXGZ\n"
-        "1.BASTARDA/ANDREJ MR\n"
+        "Primer: RP/LJUS... AB12CD\n"
+        "1.NOVAK/JANEZ MR\n"
         "3 CA 974 T 07MAR 7 VCEPEK HK2 2115 1415+1 *1A/E*\n"
         "...\n"
         "GRAND TOTAL EUR 875.20"
