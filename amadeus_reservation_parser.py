@@ -799,9 +799,15 @@ def build_summary_text(passengers, locator, segments, baggage_text, cabin_baggag
     else:
         lines.append("Ni vnesena.")
     lines.append("")
-    lines.append("POGOJI VOZOVNICE")
-    lines.append("Strošek spremembe: " + (change_fee.strip() or "Ni vnesen"))
-    lines.append("Strošek odpovedi: " + (cancellation_fee.strip() or "Ni vnesen"))
+    fee_lines = []
+    if change_fee.strip():
+        fee_lines.append("Strošek spremembe: " + change_fee.strip())
+    if cancellation_fee.strip():
+        fee_lines.append("Strošek odpovedi: " + cancellation_fee.strip())
+    if fee_lines:
+        lines.append("")
+        lines.append("POGOJI VOZOVNICE")
+        lines.extend(fee_lines)
     return "\n".join(lines)
 
 
@@ -936,62 +942,25 @@ if result:
     baggage_text = baggage_summary(segments, result["baggage_by_flight"])
 
     st.markdown("#### Prepoznani podatki")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown('<div class="section-card"><div class="section-title">Potnik(i)</div>', unsafe_allow_html=True)
-        st.write(", ".join(passengers) if passengers else "Imen potnikov nisem prepoznala.")
-        st.markdown("</div>", unsafe_allow_html=True)
-    with col2:
-        st.markdown('<div class="section-card"><div class="section-title">Številka rezervacije</div>', unsafe_allow_html=True)
-        st.write(locator or "Številke rezervacije nisem prepoznala.")
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="section-card"><div class="section-title">Rezervirani leti</div>', unsafe_allow_html=True)
-    if segments:
-        rows = []
-        for segment in segments:
-            rows.append({
-                "Datum": segment["date"].strftime("%d.%m.%Y"),
-                "Let": segment["flight"],
-                "Relacija": f"{segment['origin_city']} ({segment['origin']}) – {segment['destination_city']} ({segment['destination']})",
-                "Odhod": segment["departure"],
-                "Prihod": segment["arrival"] + (" (+1 dan)" if segment["arrival_date"] > segment["date"] else ""),
-                "Trajanje leta": format_duration(segment["duration_minutes"]),
-                "Čas prestopa": format_duration(segment["layover_minutes"]),
-            })
-        render_copyable_flight_table(rows)
-    else:
-        st.warning("Letov nisem prepoznala. Preveri, ali so v vnosu vrstice segmentov iz PNR-ja.")
+    # Kompakten prikaz podatkov za agenta: brez ponavljanja imen, PNR-ja in letov.
+    st.markdown('<div class="section-card"><div class="section-title">Oddana prtljaga – prebrano iz TST-ja</div>', unsafe_allow_html=True)
+    st.write(baggage_text)
     st.markdown("</div>", unsafe_allow_html=True)
+    cabin_baggage = st.checkbox("Ročna prtljaga vključena", value=True, key="cabin_baggage")
 
-    st.markdown("#### Prtljaga")
-    luggage_col1, luggage_col2 = st.columns(2)
-    with luggage_col1:
-        cabin_baggage = st.checkbox("Ročna prtljaga vključena", value=True, key="cabin_baggage")
-    with luggage_col2:
-        st.markdown('<div class="section-card"><div class="section-title">Oddana prtljaga (iz TST-ja)</div>', unsafe_allow_html=True)
-        st.write(baggage_text)
-        st.caption("Oddana prtljaga je prebrana iz TST-ja in je v tem orodju ni mogoče ročno spreminjati.")
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="section-card"><div class="section-title">Cena, prebrana iz TST-ja</div>', unsafe_allow_html=True)
+    if price:
+        st.markdown(f"<div style='font-size:17px;font-weight:700;color:#004899'>{html.escape(price['display'])}</div>", unsafe_allow_html=True)
+    else:
+        st.write("Cena ni bila prepoznana. Preveri vrstice TOTAL / GRAND TOTAL.")
+    st.markdown("</div>", unsafe_allow_html=True)
+    final_price = st.text_input("Cena za stranko", placeholder="Agent vnese končno ceno", key="final_price")
+    currency = st.selectbox("Valuta", ["EUR", "USD", "GBP", "CHF", "Other"], index=0, key="final_currency")
 
-    st.markdown("#### Cena in pogoji vozovnice")
-    price_col, reference_col = st.columns([1.2, 1])
-    with price_col:
-        final_price = st.text_input("Končna cena za stranko", placeholder="Agent vnese končno ceno", key="final_price")
-        currency = st.selectbox("Valuta", ["EUR", "USD", "GBP", "CHF", "Other"], index=0, key="final_currency")
-    with reference_col:
-        if price:
-            st.markdown('<div class="section-card"><div class="section-title">Cena, prebrana iz TST-ja</div>', unsafe_allow_html=True)
-            st.markdown(f"<h3 style='margin:0;color:#004899'>{html.escape(price['display'])}</h3>", unsafe_allow_html=True)
-            st.caption("Referenčni podatek za kontrolo; ne nadomesti agentove končne cene.")
-            st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            st.info("Cena iz TST-ja ni bila prepoznana. Preveri vrstice TOTAL / GRAND TOTAL.")
-    fee_col1, fee_col2 = st.columns(2)
-    with fee_col1:
-        change_fee = st.text_input("Strošek spremembe", placeholder="Npr. 150 EUR ali brezplačno", key="change_fee")
-    with fee_col2:
-        cancellation_fee = st.text_input("Strošek odpovedi", placeholder="Npr. 250 EUR ali nevračljiva vozovnica", key="cancellation_fee")
+    st.markdown("#### Pogoji vozovnice")
+    change_fee = st.text_input("Strošek spremembe", placeholder="Pusti prazno, če ne želiš prikaza", key="change_fee")
+    cancellation_fee = st.text_input("Strošek odpovedi", placeholder="Pusti prazno, če ne želiš prikaza", key="cancellation_fee")
 
     st.markdown("#### Končni povzetek")
     summary_text = build_summary_text(
@@ -1023,7 +992,7 @@ if result:
     summary_html_lines = [
         '<div style="font-family:Roboto,Arial,sans-serif;color:#233044;max-width:100%;line-height:1.45;">',
         '<div style="padding:16px 18px 13px;background:#004899;border-radius:10px 10px 0 0;color:#ffffff;border-bottom:5px solid #FBB900;">',
-        '<div style="font-size:22px;font-weight:700;color:#FBB900;">Povzetek letalske rezervacije</div>',
+        '<div style="font-size:22px;font-weight:700;color:#FFFFFF;">Povzetek letalske rezervacije</div>',
         '</div>',
         '<div style="border:1px solid #DCE3EC;border-top:0;padding:12px 14px 14px;border-radius:0 0 10px 10px;">',
         '<table style="border-collapse:collapse;width:100%;font-size:13px;margin-bottom:14px;">',
@@ -1041,8 +1010,8 @@ if result:
         '<div style="font-size:15px;font-weight:700;color:#004899;margin:0 0 7px;">Cena in pogoji vozovnice</div>',
         '<table style="border-collapse:collapse;width:100%;font-size:13px;">',
         f'<tr><td style="padding:8px 9px;background:#FFF7DF;border-left:4px solid #FBB900;font-weight:700;width:38%;">Končna cena</td><td style="padding:8px 9px;background:#FFF7DF;color:#004899;font-size:16px;font-weight:700;">{html.escape(final_price_text)}</td></tr>',
-        f'<tr><td style="padding:7px 9px;background:#F5F8FC;border-bottom:1px solid #E2E8F0;font-weight:700;">Strošek spremembe</td><td style="padding:7px 9px;border-bottom:1px solid #E2E8F0;">{html.escape(change_fee.strip() or "Ni vnesen")}</td></tr>',
-        f'<tr><td style="padding:7px 9px;background:#F5F8FC;font-weight:700;">Strošek odpovedi</td><td style="padding:7px 9px;">{html.escape(cancellation_fee.strip() or "Ni vnesen")}</td></tr>',
+        *([f'<tr><td style="padding:7px 9px;background:#F5F8FC;border-bottom:1px solid #E2E8F0;font-weight:700;">Strošek spremembe</td><td style="padding:7px 9px;border-bottom:1px solid #E2E8F0;">{html.escape(change_fee.strip())}</td></tr>'] if change_fee.strip() else []),
+        *([f'<tr><td style="padding:7px 9px;background:#F5F8FC;font-weight:700;">Strošek odpovedi</td><td style="padding:7px 9px;">{html.escape(cancellation_fee.strip())}</td></tr>'] if cancellation_fee.strip() else []),
         '</table>',
         '</div></div>',
     ]
