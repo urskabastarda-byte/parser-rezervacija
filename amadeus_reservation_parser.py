@@ -552,27 +552,93 @@ def nice_name(raw_name):
     return f"{name} ({title_labels.get(title, title.title())})" if title else name
 
 
-def parse_passengers(raw):
-    """Poišče potniška imena v PNR/TST vrsticah, pri čemer odstrani podvojitve."""
+def parse_passenger_details(raw):
+    """Prepozna potnike, številko v PNR-ju in kategorijo (adult/child/infant)."""
     found = []
-    patterns = [
-        re.compile(r"(?<![A-Z0-9])\d+\.\s*([A-Z][A-Z' -]+/[A-Z][A-Z' -]+?)(?=\s{2,}\d+\.|\s*$)", re.I),
-        re.compile(r"(?<![A-Z0-9])\d+\.\s*([A-Z][A-Z' -]+/[A-Z][A-Z' -]+)", re.I),
-    ]
+    seen = set()
     for line in raw.splitlines():
-        if not re.search(r"\d+\.", line):
+        # Passenger lines are numbered, e.g. 1.NOVAK/DREJC(INS/24JUN25)
+        match = re.match(r"^\s*(\d+)\.\s*([A-Z][A-Z' -]*/[A-Z][A-Z' -]+?)(?=\s*\(|\s{2,}|$)", line, re.I)
+        if not match:
             continue
-        for pattern in patterns:
-            for match in pattern.finditer(line):
-                value = re.sub(r"\s+", " ", match.group(1)).strip()
-                # Avoid matching unrelated numbered fields.
-                if "/" in value and len(value) < 70 and re.search(r"[A-Z]", value):
-                    formatted = nice_name(value)
-                    if formatted and formatted not in found:
-                        found.append(formatted)
-            if found:
-                break
+        number = int(match.group(1))
+        raw_name = re.sub(r"\s+", " ", match.group(2)).strip().rstrip()
+        # Keep name clean if the PNR has a child/infant marker directly after it.
+        raw_name = re.sub(r"\s+", " ", raw_name)
+        upper_line = line.upper()
+        if re.search(r"\bCHD(?:/|\b)", upper_line):
+            category = "child"
+            label = "otrok"
+        elif re.search(r"\bINS(?:/|\b)", upper_line):
+            category = "infant_seat"
+            label = "dojenček na svojem sedežu"
+        elif re.search(r"\bINF(?:/|\b)", upper_line):
+            category = "infant_lap"
+            label = "dojenček v naročju"
+        else:
+            category = "adult"
+            label = "odrasli"
+        key = (number, raw_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append({
+            "number": number,
+            "raw_name": raw_name,
+            "name": nice_name(raw_name),
+            "category": category,
+            "category_label": label,
+        })
     return found
+
+
+def parse_passengers(raw):
+    """Vrne prikazna imena potnikov; ohranja združljivost s preostalim parserjem."""
+    return [p["name"] for p in parse_passenger_details(raw)]
+
+
+def parse_tst_category_prices(raw, passenger_details):
+    """Poveže cene iz TST-blokov s kategorijami potnikov, ne glede na vrstni red TST-jev."""
+    category_by_number = {p["number"]: p["category"] for p in passenger_details}
+    amounts = {"adult": [], "child": [], "infant": []}
+    # A TST block may contain one or more PC.<passenger number> references.
+    blocks = re.split(r"(?=\bTST\s*\d+\b)", raw, flags=re.I)
+    for block in blocks:
+        if not re.search(r"\bTST\s*\d+\b", block, re.I):
+            continue
+        pcs = [int(x) for x in re.findall(r"\bPC\.(\d+)\b", block, re.I)]
+        money = re.search(r"\bEUR\s+([\d,]+(?:\.\d{2})?)", block, re.I)
+        if not money:
+            money = re.search(r"\b([A-Z]{3})\s+([\d,]+(?:\.\d{2})?)", block, re.I)
+            if money:
+                currency, amount_text = money.group(1).upper(), money.group(2)
+            else:
+                continue
+        else:
+            currency, amount_text = "EUR", money.group(1)
+        try:
+            amount = float(amount_text.replace(",", ""))
+        except ValueError:
+            continue
+        for passenger_number in pcs:
+            category = category_by_number.get(passenger_number)
+            if category == "adult":
+                amounts["adult"].append((amount, currency))
+            elif category == "child":
+                amounts["child"].append((amount, currency))
+            elif category in {"infant_seat", "infant_lap"}:
+                amounts["infant"].append((amount, currency))
+    result = {}
+    for category, values in amounts.items():
+        # Only display a single reference price when the category's TST prices agree.
+        unique = list(dict.fromkeys(values))
+        if len(unique) == 1:
+            amount, currency = unique[0]
+            display = f"{amount:,.2f} {currency}".replace(",", "X").replace(".", ",").replace("X", ".")
+            result[category] = {"amount": amount, "currency": currency, "display": display}
+        elif len(unique) > 1:
+            result[category] = {"display": "Več različnih cen v TST-ju"}
+    return result
 
 
 def parse_record_locator(raw):
@@ -675,15 +741,19 @@ def baggage_summary(segments, baggage_by_flight):
 
 def parse_reservation(raw):
     segments = parse_segments(raw)
-    passengers = parse_passengers(raw)
+    passenger_details = parse_passenger_details(raw)
+    passengers = [p["name"] for p in passenger_details]
     locator = parse_record_locator(raw)
     price = parse_tst_price(raw)
+    category_prices = parse_tst_category_prices(raw, passenger_details)
     baggage = parse_tst_baggage(raw)
     return {
         "segments": segments,
         "passengers": passengers,
+        "passenger_details": passenger_details,
         "locator": locator,
         "price": price,
+        "category_prices": category_prices,
         "baggage_by_flight": baggage,
     }
 
@@ -769,7 +839,7 @@ def format_money_input(value):
 
 
 def build_summary_text(passengers, locator, segments, baggage_text, cabin_baggage,
-                       final_price, currency, change_fee, cancellation_fee):
+                       final_prices, currency, change_fee, cancellation_fee):
     lines = ["POVZETEK LETALSKE REZERVACIJE", ""]
     lines.append("Potnik(i): " + (", ".join(passengers) if passengers else "Ni prepoznano"))
     lines.append("Številka rezervacije: " + (locator or "Ni prepoznana"))
@@ -779,35 +849,24 @@ def build_summary_text(passengers, locator, segments, baggage_text, cabin_baggag
         lines.append("Leti niso bili prepoznani iz prilepljenih podatkov.")
     for segment in segments:
         date_text = segment["date"].strftime("%d.%m.%Y")
-        route = (
-            f"{segment['origin_city']} ({segment['origin']}) – "
-            f"{segment['destination_city']} ({segment['destination']})"
-        )
+        route = f"{segment['origin_city']} ({segment['origin']}) – {segment['destination_city']} ({segment['destination']})"
         arrival_suffix = " (+1 dan)" if segment["arrival_date"] > segment["date"] else ""
-        lines.append(
-            f"{date_text} | {segment['flight']} | {route} | "
-            f"{segment['departure']}–{segment['arrival']}{arrival_suffix}"
-        )
-    lines.append("")
-    lines.append("PRTLJAGA")
-    lines.append("Ročna prtljaga: vključena." if cabin_baggage else "Ročna prtljaga: ni vključena.")
-    lines.append(baggage_text)
-    lines.append("")
-    lines.append("KONČNA CENA")
-    if final_price.strip():
-        lines.append(f"{final_price.strip()} {currency}")
-    else:
+        lines.append(f"{date_text} | {segment['flight']} | {route} | {segment['departure']}–{segment['arrival']}{arrival_suffix}")
+    lines.extend(["", "PRTLJAGA", "Ročna prtljaga: vključena." if cabin_baggage else "Ročna prtljaga: ni vključena.", baggage_text, "", "KONČNA CENA"])
+    labels = {"adult": "Odrasli", "child": "Otrok", "infant": "Dojenček"}
+    populated = False
+    for key, label in labels.items():
+        value = final_prices.get(key, "").strip()
+        if value:
+            lines.append(f"{label}: {value} {currency}".strip())
+            populated = True
+    if not populated:
         lines.append("Ni vnesena.")
-    lines.append("")
     fee_lines = []
-    if change_fee.strip():
-        fee_lines.append("Strošek spremembe: " + change_fee.strip())
-    if cancellation_fee.strip():
-        fee_lines.append("Strošek odpovedi: " + cancellation_fee.strip())
+    if change_fee.strip(): fee_lines.append("Strošek spremembe: " + change_fee.strip())
+    if cancellation_fee.strip(): fee_lines.append("Strošek odpovedi: " + cancellation_fee.strip())
     if fee_lines:
-        lines.append("")
-        lines.append("POGOJI VOZOVNICE")
-        lines.extend(fee_lines)
+        lines.extend(["", "POGOJI VOZOVNICE", *fee_lines])
     return "\n".join(lines)
 
 
@@ -954,20 +1013,38 @@ if result:
     cabin_baggage = st.checkbox("Ročna prtljaga vključena", value=True, key="cabin_baggage")
 
     st.markdown("#### Cena")
-    if price:
+    category_prices = result.get("category_prices", {})
+    passenger_details = result.get("passenger_details", [])
+    present_categories = {p["category"] for p in passenger_details}
+    infant_present = bool(present_categories & {"infant_seat", "infant_lap"})
+    if category_prices:
+        price_lines = []
+        for key, label in (("adult", "Odrasli"), ("child", "Otrok"), ("infant", "Dojenček")):
+            if key in category_prices:
+                price_lines.append(f"{label}: {category_prices[key]['display']}")
+        if price_lines:
+            st.markdown(
+                "<div style='margin:0;padding:0;font-size:14px;font-weight:600;color:#004899;'>" +
+                "<br>".join(html.escape(line) for line in price_lines) +
+                "</div><div style='font-size:12px;font-weight:400;color:#666;margin:0;padding:0;'>(prebrano iz TST-ja)</div>",
+                unsafe_allow_html=True,
+            )
+    elif price:
         st.markdown(
-            f"<div style='margin:0;padding:0;font-size:16px;font-weight:600;color:#004899;'>"
-            f"{html.escape(price['display'])}</div>"
-            "<div style='font-size:12px;font-weight:400;color:#666;margin:0;padding:0;'>(prebrano iz TST-ja)</div>",
+            f"<div style='margin:0;padding:0;font-size:16px;font-weight:600;color:#004899;'>{html.escape(price['display'])}</div>"
+            "<div style='font-size:12px;font-weight:400;color:#666;margin:0;padding:0;'>(prebrano iz TST-ja; kategorije niso razločene)</div>",
             unsafe_allow_html=True,
         )
     else:
-        st.markdown(
-            "<div style='font-size:14px;margin:0;padding:0;'>Cena ni bila prepoznana. "
-            "Preveri vrstice TOTAL / GRAND TOTAL.</div>",
-            unsafe_allow_html=True,
-        )
-    final_price = st.text_input("Cena za stranko", placeholder="Agent vnese končno ceno", key="final_price")
+        st.markdown("<div style='font-size:14px;margin:0;padding:0;'>Cena ni bila prepoznana iz TST-ja.</div>", unsafe_allow_html=True)
+
+    final_prices = {}
+    if "adult" in present_categories:
+        final_prices["adult"] = st.text_input("Cena za stranko – odrasli", placeholder="Cena za odraslega", key="final_price_adult")
+    if "child" in present_categories:
+        final_prices["child"] = st.text_input("Cena za stranko – otrok", placeholder="Cena za otroka", key="final_price_child")
+    if infant_present:
+        final_prices["infant"] = st.text_input("Cena za stranko – dojenček", placeholder="Cena za dojenčka", key="final_price_infant")
     currency = st.selectbox("Valuta", ["EUR", "USD", "GBP", "CHF", "Other"], index=0, key="final_currency")
 
     st.markdown("#### Pogoji vozovnice")
@@ -977,15 +1054,17 @@ if result:
     st.markdown("#### Končni povzetek")
     summary_text = build_summary_text(
         passengers, locator, segments, baggage_text, cabin_baggage,
-        final_price, currency, change_fee, cancellation_fee,
+        final_prices, currency, change_fee, cancellation_fee,
     )
 
     # Lep HTML predložek za prikaz in kopiranje v e-pošto/Word.
     # Plain-text različica ostane alternativa za odložišče, ki ne podpira HTML-ja.
     passenger_text = ", ".join(passengers) if passengers else "Ni prepoznano"
     locator_text = locator or "Ni prepoznana"
-    final_price_text = ((final_price.strip() + " " + currency).strip()
-                        if final_price.strip() else "Ni vnesena")
+    price_label_map = {"adult": "Odrasli", "child": "Otrok", "infant": "Dojenček"}
+    final_price_lines = [f"{html.escape(price_label_map[k])}: {html.escape(v.strip())} {html.escape(currency)}".strip()
+                         for k, v in final_prices.items() if v.strip()]
+    final_price_text = "<br>".join(final_price_lines) if final_price_lines else "Ni vnesena"
     cabin_text = "Vključena" if cabin_baggage else "Ni vključena"
 
     flight_rows = []
@@ -1021,7 +1100,7 @@ if result:
         '</table>',
         '<div style="font-size:15px;font-weight:700;color:#004899;margin:0 0 7px;">Cena in pogoji vozovnice</div>',
         '<table style="border-collapse:collapse;width:100%;font-size:13px;">',
-        f'<tr><td style="padding:8px 9px;background:#FFF7DF;border-left:4px solid #FBB900;font-weight:700;width:38%;">Končna cena</td><td style="padding:8px 9px;background:#FFF7DF;color:#004899;font-size:16px;font-weight:700;">{html.escape(final_price_text)}</td></tr>',
+        f'<tr><td style="padding:8px 9px;background:#FFF7DF;border-left:4px solid #FBB900;font-weight:700;width:38%;">Končna cena</td><td style="padding:8px 9px;background:#FFF7DF;color:#004899;font-size:16px;font-weight:700;">{final_price_text}</td></tr>',
         *([f'<tr><td style="padding:7px 9px;background:#F5F8FC;border-bottom:1px solid #E2E8F0;font-weight:700;">Strošek spremembe</td><td style="padding:7px 9px;border-bottom:1px solid #E2E8F0;">{html.escape(change_fee.strip())}</td></tr>'] if change_fee.strip() else []),
         *([f'<tr><td style="padding:7px 9px;background:#F5F8FC;font-weight:700;">Strošek odpovedi</td><td style="padding:7px 9px;">{html.escape(cancellation_fee.strip())}</td></tr>'] if cancellation_fee.strip() else []),
         '</table>',
